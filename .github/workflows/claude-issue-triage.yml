@@ -1,0 +1,136 @@
+name: Claude Issue Triage
+
+on:
+  issues:
+    types: [opened, edited]
+
+concurrency:
+  group: issue-triage-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    if: >-
+      github.event.issue.pull_request == null &&
+      !endsWith(github.event.issue.user.login, '[bot]') &&
+      !contains(github.event.issue.body, '@claude') &&
+      !contains(github.event.issue.title, '@claude')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Ensure triage labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "P1" --color "b60205" --description "Crítico: rompe el juego o impide jugar" --force
+          gh label create "P2" --color "fbca04" --description "Importante: afecta la experiencia, hay workaround" --force
+          gh label create "P3" --color "0e8a16" --description "Menor: detalle estético o nice-to-have" --force
+          gh label create "area:gameplay" --color "5319e7" --description "Piezas, rotación, colisiones, drop, spawn" --force
+          gh label create "area:rendering" --color "1d76db" --description "Canvas, dibujo, colores, ghost, preview" --force
+          gh label create "area:input" --color "c2e0c6" --description "Teclado y controles" --force
+          gh label create "area:scoring" --color "f9d0c4" --description "Puntaje, líneas, niveles, velocidad" --force
+          gh label create "area:ui" --color "bfd4f2" --description "HTML/CSS, HUD, overlays" --force
+
+      - name: Run Claude Issue Triage
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_args: >-
+            --allowedTools "Bash(gh label list:*),Bash(gh issue view:*),Bash(gh issue edit:*),Bash(gh issue comment:*),Read,Grep,Glob,Write"
+            --max-turns 25
+          prompt: |
+            Eres el asistente de triage de issues para el repositorio ${{ github.repository }}.
+            El issue a analizar es el número ${{ github.event.issue.number }}.
+
+            Contexto del proyecto: es un Tetris clásico en JavaScript vanilla con HTML5 Canvas
+            (sin dependencias, sin build). Toda la lógica del juego vive en `game.js`. La UI y
+            los textos de cara al usuario están en español (mantén ese idioma en tu diagnóstico).
+
+            Tu tarea tiene dos partes: (1) aplicar labels, y (2) publicar un diagnóstico técnico.
+            NO escribas ni modifiques código del repositorio, NO abras ramas ni pull requests,
+            NO cierres el issue. El único archivo que puedes escribir es un borrador temporal en
+            $RUNNER_TEMP para preparar el comentario.
+
+            Pasos:
+
+            1. Ejecuta `gh label list` para conocer las labels reales disponibles en el repo.
+               Sólo puedes usar labels que aparezcan en esa lista — nunca inventes una nueva.
+
+            2. Ejecuta `gh issue view ${{ github.event.issue.number }} --comments` para leer el
+               título, el cuerpo y los comentarios existentes del issue.
+
+            3. Lee el código relevante con Read/Grep/Glob para entender la zona implicada.
+               El repo es pequeño: `game.js` (toda la lógica: piezas, colisiones, rotación,
+               scoring, render), `index.html` y `style.css`. Verifica en el código cada archivo,
+               función o número de línea antes de citarlo en tu diagnóstico — no los inventes.
+
+            4. Aplica labels con `gh issue edit ${{ github.event.issue.number }} --add-label ...`:
+               - Exactamente un tipo: `bug`, `enhancement`, `documentation` o `question`.
+               - Exactamente una prioridad: `P1` (crítico, rompe el juego), `P2` (importante,
+                 hay workaround) o `P3` (menor/estético).
+               - Una o más labels de área (`area:gameplay`, `area:rendering`, `area:input`,
+                 `area:scoring`, `area:ui`) según lo que toque el código.
+               - Si el issue parece duplicado de otro issue ABIERTO, agrega también `duplicate`.
+               - Puedes usar `--remove-label` únicamente sobre labels `P1`/`P2`/`P3` o `area:*`
+                 que hayas puesto tú mismo en un análisis anterior y que ya no apliquen tras una
+                 edición del issue. Nunca quites una label que no sea de esas categorías (por
+                 ejemplo, nunca quites labels puestas manualmente por una persona).
+
+            5. Escribe el diagnóstico en un archivo temporal (por ejemplo
+               "$RUNNER_TEMP/diagnostico.md") con este formato exacto, en español:
+
+               ```
+               <!-- claude-diagnostico -->
+               ## 🔎 Diagnóstico automático
+
+               **Tipo:** <tipo elegido> · **Prioridad:** <P1/P2/P3> · **Área:** <área(s)>
+
+               ### Resumen
+               2-3 líneas explicando qué se reporta.
+
+               ### Comportamiento esperado vs. actual
+               (incluye esta sección sólo si es un bug)
+
+               ### Zona del código implicada
+               - `archivo:línea` — función/bloque: explicación breve de por qué es relevante.
+
+               ### Causa raíz probable
+               Tu hipótesis basada en el código leído. Si no pudiste confirmarla leyendo el
+               código, dilo explícitamente como hipótesis.
+
+               ### Enfoque de solución propuesto
+               1. Pasos concretos y acotados para resolverlo (sin escribir el código real).
+
+               ### Criterios de aceptación
+               - Cómo comprobar a mano en el navegador que quedó resuelto.
+
+               ### Riesgos y dudas abiertas
+               - Cualquier duda, o "Falta información: ..." si el issue no da datos suficientes
+                 (en ese caso aplica también la label `question`).
+
+               ---
+               🤖 Generado automáticamente al abrir/editar el issue. Este comentario se
+               reescribe cada vez que el issue se edita.
+               ```
+
+            6. Publica el diagnóstico así:
+               - Intenta primero:
+                 `gh issue comment ${{ github.event.issue.number }} --edit-last --create-if-none --body-file "$RUNNER_TEMP/diagnostico.md"`
+               - Antes de usar `--edit-last`, confirma con `gh issue view ${{ github.event.issue.number }} --comments`
+                 que el ÚLTIMO comentario del bot contiene el marcador `<!-- claude-diagnostico -->`.
+                 Si no lo contiene (por ejemplo porque el último comentario es de una persona),
+                 publica un comentario nuevo sin `--edit-last`:
+                 `gh issue comment ${{ github.event.issue.number }} --body-file "$RUNNER_TEMP/diagnostico.md"`
+
+            Sé preciso y conciso. No comuniques nada directamente al usuario fuera del formato
+            de diagnóstico anterior; no agregues comentarios adicionales de ningún tipo.
